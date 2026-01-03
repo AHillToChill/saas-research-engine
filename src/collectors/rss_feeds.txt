@@ -1,0 +1,14 @@
+# lane	site	feed_url
+# --- Lane A: simulation / digital twin-ish ---
+A	github.com/simpy-releases	https://github.com/simpx/simpy/releases.atom
+
+# --- Lane B: reporting / BI / automation (buyer-adjacent ops tooling) ---
+B	powerbi.microsoft.com	https://powerbi.microsoft.com/en-us/blog/feed/
+B	microsoft.com/power-automate	https://www.microsoft.com/en-us/power-platform/blog/power-automate/feed/
+B	microsoft.com/power-apps	https://www.microsoft.com/en-us/power-platform/blog/power-apps/feed/
+
+# --- Lane C: routing / logistics / OR tooling ---
+C	github.com/or-tools-releases	https://github.com/google/or-tools/releases.atom
+C	logisticsviewpoints.com	https://logisticsviewpoints.com/feed/
+C	logisticsmatter.com	https://logisticsmatter.com/feed/
+C	logisticsmonthly.com	https://www.logisticsmonthly.com/feed/
