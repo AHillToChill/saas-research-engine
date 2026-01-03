@@ -52,7 +52,30 @@ def load_stopwords_txt(path: Path) -> set[str]:
     return {line.strip().lower() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
 
 
+def load_terms_txt(path: Path) -> list[str]:
+    """
+    Loads a newline-delimited term file.
+    - blank lines ignored
+    - lines starting with # ignored
+    - terms are lowercased
+    """
+    if not path.exists():
+        return []
+    terms: list[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        t = raw.strip()
+        if not t:
+            continue
+        if t.startswith("#"):
+            continue
+        terms.append(t.lower())
+    return terms
+
+
 GLOBAL_STOP_PATH = Path("src/cluster/stopwords_global.txt")
+TOOL_WORDS_PATH = Path("src/cluster/tool_words.txt")
+BUYER_WORDS_PATH = Path("src/cluster/buyer_words.txt")
+BUYER_PHRASES_PATH = Path("src/cluster/buyer_phrases.txt")  # optional file
 
 
 @dataclass
@@ -68,8 +91,6 @@ class PU:
 
 
 def ensure_tables(con: sqlite3.Connection) -> None:
-    # Assumes init_db created: clusters, cluster_members.
-    # embed_pain_units.py creates pain_unit_embeddings.
     con.commit()
 
 
@@ -138,7 +159,6 @@ def build_doc(pu: PU) -> str:
 
 
 def auto_stopwords_from_df(vectorizer: TfidfVectorizer, X, df_frac_threshold: float = 0.60) -> set[str]:
-    # Terms appearing in >60% of docs are likely glue terms in this corpus.
     df = (X > 0).sum(axis=0)
     if hasattr(df, "A1"):
         df = df.A1
@@ -189,36 +209,74 @@ def top_terms_for_cluster(X_tfidf, labels: np.ndarray, cluster_idx: int, vectori
     return [terms[i] for i in top_ids if mean_vec[i] > 0]
 
 
-def compute_opportunity_score(size: int, mean_sev: float, mean_pi: float, tool_rate: float, buyer_rate: float) -> float:
+def compute_opportunity_score(
+    size: int,
+    mean_sev: float,
+    mean_pi: float,
+    tool_rate: float,
+    buyer_rate: float,
+    buyer_intent_rate: float,
+) -> float:
     base = math.log1p(size) * (mean_sev + 0.75 * mean_pi)
     base *= (1.0 + 0.25 * tool_rate)
     base *= (1.0 + 0.10 * buyer_rate)
+    base *= (1.0 + 0.35 * buyer_intent_rate)
     return float(base)
 
 
-TOOL_WORDS = {
-    "tool", "tools", "software", "app", "service", "platform",
-    "automate", "automation", "schedule", "scheduler", "monitor", "monitoring",
-    "dashboard", "reporting", "pipeline", "integration", "api",
-    "subscription", "pricing", "license", "deploy", "deployment",
-}
-
-BUYER_WORDS = {
-    "business", "company", "customer", "clients", "client", "team",
-    "operations", "ops", "production", "workflow", "manager", "finance",
-    "sales", "support", "deliver", "delivery", "dispatch",
-}
+# --- NEW: tokenization + safe whole-word / phrase matching -----------------
 
 
-def rate_contains(docs: list[str], wordset: set[str]) -> float:
-    if not docs:
+TOKEN_RE = re.compile(r"[a-z0-9]+", flags=re.IGNORECASE)
+
+
+def tokenize(text: str) -> set[str]:
+    """
+    Lowercase alphanumeric tokens only.
+    Prevents substring false positives like:
+      - 'app' matching 'application'
+      - 'ops' matching 'stops'
+    """
+    if not text:
+        return set()
+    return {m.group(0).lower() for m in TOKEN_RE.finditer(text)}
+
+
+def normalize_space(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def rate_words(docs: list[str], wordset: set[str]) -> float:
+    """
+    Hit if any token in doc is in wordset (exact token match).
+    """
+    if not docs or not wordset:
         return 0.0
     hits = 0
     for d in docs:
-        t = d.lower()
-        if any(w in t for w in wordset):
+        toks = tokenize(d)
+        if toks and (toks & wordset):
             hits += 1
     return hits / len(docs)
+
+
+def rate_phrases(docs: list[str], phrases: list[str]) -> float:
+    """
+    Hit if any normalized phrase appears as substring in normalized doc text.
+    Phrases are higher precision than single tokens for buyer-intent.
+    """
+    if not docs or not phrases:
+        return 0.0
+    pats = [normalize_space(p) for p in phrases if p.strip()]
+    hits = 0
+    for d in docs:
+        t = normalize_space(d)
+        if any(p in t for p in pats):
+            hits += 1
+    return hits / len(docs)
+
+
+# ---------------------------------------------------------------------------
 
 
 def insert_cluster(con: sqlite3.Connection, lane: str, method: str, label: str, summary: str, score: float) -> int:
@@ -319,14 +377,22 @@ def main() -> None:
 
         n = X.shape[0]
         base = int(max(12, min(80, round(math.sqrt(n) * 1.8))))
-        candidate_ks = sorted({
-            max(8, base - 20),
-            max(10, base - 10),
-            base,
-            min(80, base + 10),
-            min(80, base + 20),
-            15, 20, 25, 30, 40, 50, 60
-        })
+        candidate_ks = sorted(
+            {
+                max(8, base - 20),
+                max(10, base - 10),
+                base,
+                min(80, base + 10),
+                min(80, base + 20),
+                15,
+                20,
+                25,
+                30,
+                40,
+                50,
+                60,
+            }
+        )
         candidate_ks = [k for k in candidate_ks if 2 <= k < n]
 
         best_k, best_sil = pick_k_embeddings(X, candidate_ks)
@@ -335,7 +401,6 @@ def main() -> None:
         km = KMeans(n_clusters=best_k, random_state=42, n_init="auto")
         labels = km.fit_predict(X)
 
-        # Confidence: cosine similarity to assigned centroid (embeddings are normalized)
         centroids = km.cluster_centers_.astype(np.float32)
         cent_norm = centroids / (np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-12)
         sims = np.sum(X * cent_norm[labels], axis=1)
@@ -345,12 +410,15 @@ def main() -> None:
         n_noise = int(noise_mask.sum())
         print(f"Noise assignment: {n_noise}/{n} moved to NOISE (threshold={noise_thresh:.4f})")
 
-        # Create adjusted labels once (this also fixes your prior SyntaxError line cleanly)
         labels_adj = np.where(noise_mask, -1, labels).astype(int)
 
-        # Build TF-IDF for keyword summaries (automatic stopwords expansion, global)
         global_stop = load_stopwords_txt(GLOBAL_STOP_PATH)
         vectorizer, X_tfidf = build_tfidf(docs, global_stop)
+
+        # NEW: load word/phrase lists and convert to token sets for exact matching
+        tool_words = set(load_terms_txt(TOOL_WORDS_PATH))
+        buyer_words = set(load_terms_txt(BUYER_WORDS_PATH))
+        buyer_phrases = load_terms_txt(BUYER_PHRASES_PATH)
 
         stamp = now_stamp()
         OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -377,10 +445,12 @@ def main() -> None:
             mean_pi = float(np.mean([pi[i] for i in member_idx])) if member_idx else 0.0
 
             member_docs = [docs[i] for i in member_idx]
-            tool_rate = rate_contains(member_docs, TOOL_WORDS)
-            buyer_rate = rate_contains(member_docs, BUYER_WORDS)
 
-            score = compute_opportunity_score(size, mean_sev, mean_pi, tool_rate, buyer_rate)
+            tool_rate = rate_words(member_docs, tool_words)
+            buyer_rate = rate_words(member_docs, buyer_words)
+            buyer_intent_rate = rate_phrases(member_docs, buyer_phrases)
+
+            score = compute_opportunity_score(size, mean_sev, mean_pi, tool_rate, buyer_rate, buyer_intent_rate)
 
             if cidx == -1:
                 label = "T-NOISE"
@@ -399,13 +469,12 @@ def main() -> None:
                 lane_counts[lanes[i]] = lane_counts.get(lanes[i], 0) + 1
 
             cluster_stats_rows.append(
-                (cidx, db_cluster_id, label, size, mean_sev, mean_pi, tool_rate, buyer_rate, score, keywords, lane_counts)
+                (cidx, db_cluster_id, label, size, mean_sev, mean_pi, tool_rate, buyer_rate, buyer_intent_rate, score, keywords, lane_counts)
             )
 
         con.commit()
 
-        # Sort clusters by opportunity score (descending), keep noise at bottom
-        cluster_stats_rows.sort(key=lambda r: (r[0] == -1, -r[8]))
+        cluster_stats_rows.sort(key=lambda r: (r[0] == -1, -r[9]))
 
         lines: list[str] = []
         lines.append(f"# Topics Report ({method})")
@@ -419,13 +488,13 @@ def main() -> None:
         lines.append("")
         lines.append("## Ranked topic clusters")
         lines.append("")
-        lines.append("| Label | Cluster ID | Size | Mean Sev | Mean Purchase | Tool-rate | Buyer-rate | Opportunity | Keywords | Lane mix |")
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---|---|")
+        lines.append("| Label | Cluster ID | Size | Mean Sev | Mean Purchase | Tool-rate | Buyer-rate | Buyer-intent | Opportunity | Keywords | Lane mix |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
 
-        for cidx, dbid, label, size, mean_sev, mean_pi, tool_rate, buyer_rate, score, keywords, lane_counts in cluster_stats_rows:
+        for cidx, dbid, label, size, mean_sev, mean_pi, tool_rate, buyer_rate, buyer_intent_rate, score, keywords, lane_counts in cluster_stats_rows:
             lane_mix = ", ".join([f"{k}:{v}" for k, v in sorted(lane_counts.items()) if k]) or "n/a"
             lines.append(
-                f"| {label} | {dbid} | {size} | {mean_sev:.2f} | {mean_pi:.2f} | {tool_rate:.2f} | {buyer_rate:.2f} | {score:.2f} | {keywords} | {lane_mix} |"
+                f"| {label} | {dbid} | {size} | {mean_sev:.2f} | {mean_pi:.2f} | {tool_rate:.2f} | {buyer_rate:.2f} | {buyer_intent_rate:.2f} | {score:.2f} | {keywords} | {lane_mix} |"
             )
 
         def examples_for_cluster(cidx: int, n_ex: int = 6):
@@ -452,7 +521,7 @@ def main() -> None:
         for cidx in top_clusters:
             dbid = cluster_db_ids[cidx]
             row = next(r for r in cluster_stats_rows if r[0] == cidx)
-            keywords = row[9]
+            keywords = row[10]
             label = f"T-{cidx:03d}"
 
             lines.append(f"### {label} (Cluster {dbid})")
